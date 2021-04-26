@@ -1,9 +1,7 @@
 ﻿using System;
 using System.Collections.Concurrent;
 using System.Collections.Generic;
-using System.Text.RegularExpressions;
 using System.Threading;
-using FixedThreadPool.Model;
 using FixedThreadPool.Model.Enum;
 using FixedThreadPool.Model.Interfaces;
 
@@ -11,15 +9,51 @@ namespace FixedThreadPool
 {
     public class FixedThreadPoolService : IFixedThreadPool
     {
+        #region Props and fields
+
+        /// <summary>
+        /// Max thread count
+        /// </summary>
         private readonly int _maxThreadsCount;
+
+        /// <summary>
+        /// Is pool was stopped
+        /// </summary>
         private bool _stopped;
+        
+        /// <summary>
+        /// Concurrent queue tasks with low priority
+        /// </summary>
         private readonly ConcurrentQueue<ITask> _lowPriorityTasks = new ConcurrentQueue<ITask>();
+
+        /// <summary>
+        /// Concurrent queue tasks with normal priority
+        /// </summary>
         private readonly ConcurrentQueue<ITask> _normalPriorityTasks = new ConcurrentQueue<ITask>();
+
+        /// <summary>
+        /// Concurrent queue tasks with High priority
+        /// </summary>
         private readonly ConcurrentQueue<ITask> _highPriorityTasks = new ConcurrentQueue<ITask>();
+        
+        /// <summary>
+        /// Currently running threads
+        /// </summary>
         private readonly Dictionary<string, Thread> _runningThreads;
+
+        /// <summary>
+        /// Counter for executed high priority task
+        /// </summary>
         private int _highPriorityTasksCounter;
+
+        /// <summary>
+        /// Counter for created threads
+        /// </summary>
         private int _createdThreads;
 
+        /// <summary>
+        /// Count of currently running threads
+        /// </summary>
         private int TotalThreads
         {
             get
@@ -32,7 +66,12 @@ namespace FixedThreadPool
         }
 
         private readonly object _stateLock = new object();
-        
+        #endregion
+
+        /// <summary>
+        /// Thread pool with fixed amount of threads
+        /// </summary>
+        /// <param name="maxThreadsCount">Maximum threads</param>
         public FixedThreadPoolService(int maxThreadsCount)
         {
             if (maxThreadsCount <= 0)
@@ -44,6 +83,8 @@ namespace FixedThreadPool
             _runningThreads = new Dictionary<string, Thread>(maxThreadsCount);
         }
 
+        #region IFixedThreadPool
+
         public bool Execute(ITask task, Priority priority)
         {
             if (task == null)
@@ -54,12 +95,31 @@ namespace FixedThreadPool
             if (_stopped)
                 return false;
 
-            RunOrQueueTask(task, priority);
+            QueueTask(task, priority);
 
             return !_stopped;
         }
 
-        private void RunOrQueueTask(ITask task, Priority priority)
+        public void Stop()
+        {
+            _stopped = true;
+
+            while (_runningThreads.Count > 0)
+            {
+                Thread.Sleep(1000);
+            }
+        }
+
+        #endregion
+
+        #region Helpers
+
+        /// <summary>
+        /// Queue task
+        /// </summary>
+        /// <param name="task">Task</param>
+        /// <param name="priority">Priority</param>
+        private void QueueTask(ITask task, Priority priority)
         {
             switch (priority)
             {
@@ -79,7 +139,7 @@ namespace FixedThreadPool
             var newThreadNeeded = sumOfTasks > TotalThreads && TotalThreads < _maxThreadsCount;
             if (newThreadNeeded)
             {
-                StartWorkThread(_maxThreadsCount);
+                StartWorkThread();
             }
 
             lock (_stateLock)
@@ -88,12 +148,15 @@ namespace FixedThreadPool
             }
         }
 
-        private void StartWorkThread(in int maxThreadsCount)
+        /// <summary>
+        /// Starts new thread
+        /// </summary>
+        private void StartWorkThread()
         {
             Thread thread;
             lock (_stateLock)
             {
-                if (_runningThreads.Count >= maxThreadsCount)
+                if (_runningThreads.Count >= _maxThreadsCount)
                 {
                     return;
                 }
@@ -102,7 +165,7 @@ namespace FixedThreadPool
 
                 var threadName = $"Thread {_createdThreads}";
 
-                thread = new Thread(() => StartWorkThread(threadName)) {Name = threadName};
+                thread = new Thread(() => StartWorkThread(threadName)) { Name = threadName };
                 _runningThreads.Add(thread.Name, thread);
             }
 
@@ -110,6 +173,10 @@ namespace FixedThreadPool
             thread.Start();
         }
 
+        /// <summary>
+        /// Task executing main logic
+        /// </summary>
+        /// <param name="threadName">Thread name</param>
         private void StartWorkThread(string threadName)
         {
             try
@@ -118,7 +185,7 @@ namespace FixedThreadPool
                 {
                     if (TotalThreads > _maxThreadsCount)
                     {
-                        return; 
+                        return;
                     }
 
                     var task = GetNextJobToProcess();
@@ -126,7 +193,7 @@ namespace FixedThreadPool
                     {
                         lock (_stateLock)
                         {
-                            Monitor.Wait(_stateLock, new TimeSpan(0,0,0,5));
+                            Monitor.Wait(_stateLock, new TimeSpan(0, 0, 0, 5));
                         }
 
                         task = GetNextJobToProcess();
@@ -148,21 +215,33 @@ namespace FixedThreadPool
             }
         }
 
+        /// <summary>
+        /// Task queue priority logic
+        /// </summary>
+        /// <returns></returns>
         private ITask GetNextJobToProcess()
         {
             ITask task;
 
             if (!_highPriorityTasks.IsEmpty)
             {
-                if (!_normalPriorityTasks.IsEmpty && _highPriorityTasksCounter >= 3)
+                if (!_normalPriorityTasks.IsEmpty && _highPriorityTasksCounter >= 3)//if more than 3 high priority tasks was executed
                 {
+                    lock (_stateLock)
+                    {
+                        _highPriorityTasksCounter = 0;
+                    }
+
                     _normalPriorityTasks.TryDequeue(out task);
-                    _highPriorityTasksCounter = 0;
-                    return task;
+                   return task;
+                }
+
+                lock (_stateLock)
+                {
+                    _highPriorityTasksCounter++;
                 }
 
                 _highPriorityTasks.TryDequeue(out task);
-                _highPriorityTasksCounter++;
                 return task;
             }
 
@@ -172,7 +251,7 @@ namespace FixedThreadPool
                 return task;
             }
 
-            if (_highPriorityTasks.IsEmpty && _normalPriorityTasks.IsEmpty)
+            if (_highPriorityTasks.IsEmpty && _normalPriorityTasks.IsEmpty)//low priority starts only if other priorities empty
             {
                 _lowPriorityTasks.TryDequeue(out task);
                 return task;
@@ -181,6 +260,10 @@ namespace FixedThreadPool
             return null;
         }
 
+        /// <summary>
+        /// Removing thread
+        /// </summary>
+        /// <param name="threadName">thread name</param>
         private void WorkerThreadExited(string threadName)
         {
             lock (_stateLock)
@@ -189,14 +272,6 @@ namespace FixedThreadPool
             }
         }
 
-        public void Stop()
-        {
-            _stopped = true;
-
-            while (_runningThreads.Count > 0)
-            {
-                Thread.Sleep(1000);
-            }
-        }
+        #endregion
     }
 }
